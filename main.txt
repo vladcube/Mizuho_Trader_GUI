@@ -1,0 +1,741 @@
+[Mizuho_CBTraderUpdateGUI]FObject:TGUIBaseDialog
+
+import acm
+import FUxCore
+import FMonisHooks
+import FLogger
+
+logger = FLogger.FLogger('CB Trader Update GUI')
+precision = 0.0001
+
+
+class TGUIBaseDialog(FUxCore.LayoutApplication):
+
+    def __init__(self):
+        FUxCore.LayoutApplication.__init__(self)
+        self.m_shell = acm.UX().SessionManager().Shell()
+        
+        self.m_currentObject = None
+        self.m_convertibles = None
+        self.m_borrow_cost = None
+        self.m_volatility = None
+        self.m_credit_spread = None
+        self.m_issuer = None
+        self.m_ticker = None
+        self.m_bbg_conv_rate = None
+        self.m_test_mode = None
+        
+        self.m_borrow_cost_curve = None
+        self.m_see_borrow_cost_details = None
+        self.m_volatility_surface = None
+        self.m_see_volatility_details = None
+        self.m_credit_spread_curve = None
+        self.m_see_credit_spread_details = None
+        
+        
+    def HandleObject(self, obj):
+        if obj.IsKindOf('FConvertible'):
+            self.m_currentObject = obj
+            self.AddObjectToMostRecentlyUsedList(obj)
+            self.SetCaption()
+            self.UpdateControls()
+            
+    def GetCurrentObject(self):
+        return self.m_currentObject
+        
+    def HandleSetContents(self, contents):
+        if contents != None:
+            if contents.IsKindOf('FConvertible'):
+                self.HandleObject(contents)
+                
+    def HandleGetContents(self):
+        return self.m_currentObject
+        
+    def CanHandleObject(self, obj):
+        return obj.IsKindOf('FConvertible')
+        
+    def SetCaption(self):
+        if self.m_currentObject:
+            self.SetContentCaption(self.m_currentObject.StringKey())
+            
+    def HandleRegisterCommands(self, builder):
+    
+        commands = []
+        
+        fileCommands = acm.FSet()
+        
+        fileCommands.Add('FileOpen')
+        
+        builder.RegisterCommands(FUxCore.ConvertCommands(commands), fileCommands)
+        
+    def HandleStandardFileCommandInvoke(self, commandName):
+        if commandName == 'FileOpen':
+            self.OnFileOpen()
+            
+    def OnFileOpen(self):
+        selectedObject = acm.UX().Dialogs().SelectObject(self.Shell(), 'Select Convertible', 'Converibles', self.GetConvertibles(), None)
+        if selectedObject != None:
+            self.HandleObject(selectedObject)
+            
+    def ShowMessageBox(self, type, message):
+        acm.UX().Dialogs().MessageBoxOKCancel(self.Shell(), type, message)
+            
+    def GetConvertibles(self):
+        if self.m_convertibles == None:
+            self.m_convertibles = acm.FConvertible.Select('').SortByProperty('Name')
+        return self.m_convertibles
+    
+    def GetCurveNameFromHook(self, hook_name, stock):
+        if hasattr(FMonisHooks, hook_name):
+            try:
+                return getattr(FMonisHooks, hook_name)(stock)
+            except Exception as e:
+                print(e)
+        return None
+    
+    def GetStockBorrow(self, stock):
+        curve_name = self.GetCurveNameFromHook('GetStockBorrowCurve', stock)
+        if not curve_name:
+            curve_name = '%s-MONIS StockBorrow' % stock.Currency().Name()
+        return curve_name
+        
+    def CalculateBorrowCost(self):
+        try:
+            ins = self.m_currentObject
+            underlying = ins.Underlying()
+            spread_curve_name = self.GetStockBorrow(underlying)
+            spread_curve = acm.FYieldCurve[spread_curve_name]
+            borrow_cost = None
+            if spread_curve:
+                ins_spread = spread_curve.InstrumentSpread(underlying)
+                borrow_cost = ins_spread.Spread() * 100
+            return borrow_cost
+        except Exception as e:
+            logger.LOG("Can't calculate Borrow Cost -", e)
+            return None
+            
+    def GetBorrowCostCurve(self):
+        try:
+            ins = self.m_currentObject
+            underlying = ins.Underlying()
+            spread_curve_name = self.GetStockBorrow(underlying)
+            return spread_curve_name
+        except Exception as e:
+            logger.LOG("Can't get a yield curve of underlying - %s" % e)
+        
+    def GetIdentitySpreadPoint(self, vol_structure, ins, match_und_mat):
+        for p in vol_structure.Points():
+            ins_is_generic = ins.Generic()
+            ins_is_call = ins.IsCall()
+            point_is_generic = p.IsGenericExpiry()
+            point_is_call = p.Call()
+            matching_generic = (ins_is_generic and point_is_generic) or ((not ins_is_generic) and (not point_is_generic))
+            matching_call_put = (ins_is_call and point_is_call) or ((not ins_is_call) and (not point_is_call))
+            if matching_generic and matching_call_put and p.Strike() == ins.StrikePrice() and p.ActualExpiryDay() == ins.ExpiryDateOnly():
+                if match_und_mat:
+                    underlying = ins.Underlying()
+                    if underlying:
+                        und_is_generic = underlying.Generic()
+                        point_und_mat_is_generic = p.IsGenericUnderlyingMaturity()
+                        if p.ActualUnderlyingMaturityDay() == ins.ActualUnderlyingMaturityDay():
+                            if und_is_generic and point_und_mat_is_generic:
+                                return p
+                            if (not und_is_generic) and (not point_und_mat_is_generic):
+                                return p
+                else:
+                    return p
+        return None
+    
+    def GetIdentityPoint(self, vol_structure, ins):
+        for p in vol_structure.Points():
+            if p.Benchmark() == ins:
+                return p
+        return None
+    
+    def GetMatchingPoint(self, vol_structure, ins):
+        for p in vol_structure.Points():
+            if p.Benchmark() and p.Benchmark().StrikePrice() == ins.StrikePrice() and p.Benchmark().ExpireDateOnly() == ins.ExpiryDateOnly():
+                return p
+        return None
+    
+    def GetPoint(self, vol_structure, ins, match_exact=False):
+        point = self.GetIdentityPoint(vol_structure, ins)
+        if not point and not match_exact:
+            if vol_structure.IsSpreadStructure():
+                point = self.GetIdentitySpreadPoint(vol_structure, ins, True)
+                if not point:
+                    point = self.GetIdentitySpreadPoint(vol_structure, ins, False)
+            else:
+                point = self.GetMatchingPoint(vol_structure, ins)
+        return point
+        
+    def CalculateVolatility(self):
+        try:
+            ins = self.m_currentObject
+            vol_structure = ins.MappedVolatilityLink().Link().VolatilityStructure()
+            vol = self.GetPoint(vol_structure, ins)
+            vol = vol.Volatility() if vol else vol
+            return vol * 100
+        except Exception as e:
+            logger.LOG("Can't calculate Volatility -", e)
+            return None
+            
+    
+    def GetVolatilitySurface(self):
+        try:
+            ins = self.m_currentObject
+            vol_structure = ins.MappedVolatilityLink().Link().VolatilityStructure()
+            return vol_structure.Name()
+        except Exception as e:
+            logger.LOG("Can't get volatility surface -%s" % e)
+            return None
+    
+        
+    def CalculateCreditSpread(self):
+        try:
+            ins = self.m_currentObject
+            linked_credit_spread = ins.MappedCreditLink().Link().YieldCurveComponent()
+            return linked_credit_spread.Spread() * 10000
+        except Exception as e:
+            logger.LOG("Can't calculate Credit Spread -", e)
+            return None
+            
+    
+    def GetCreditSpreadCurve(self):
+        try:
+            ins = self.m_currentObject
+            linked_credit_spread = ins.MappedCreditLink().Link().YieldCurveComponent()
+            return linked_credit_spread.Curve().Name()
+        except Exception as e:
+            logger.LOG("Can't get Credit Spread - %s" % e)
+    
+        
+    def GetIssuer(self):
+        ins = self.m_currentObject
+        try:
+            issuer = ins.Issuer()
+            if issuer:
+                return issuer.Name()
+            return ''
+        except Exception as e:
+            logger.LOG("Can't get Issuer -", e)
+            return ''
+            
+        
+    def GetTicker(self):
+        ins = self.m_currentObject
+        ticker = None
+        try:
+            und = ins.Underlying()
+            for a in und.Aliases():
+                if a.Type().AliasTypeName() == 'BB_TICKER':
+                    ticker = a.Alias()
+                    return ticker
+            return ticker
+        except Exception as e:
+            logger.LOG("Can not get Ticker -", e)
+            return ''
+            
+            
+    def GetBBGConvRate(self):
+        ins = self.GetCurrentObject()
+        bbg_conv_rate = None
+        try:
+            for add_info in ins.AddInfos():
+                if add_info.AddInf().FieldName() == 'BBGconvRate':
+                    return add_info.FieldValue()
+            return ''
+        except Exception as e:
+            logger.LOG("Can not get Ticker -", e)
+            return ''
+        
+        
+    def UpdateControls(self):
+        self.borrow_cost = self.CalculateBorrowCost()
+        self.borrow_cost_curve = self.GetBorrowCostCurve()
+        self.volatility = self.CalculateVolatility()
+        self.volatility_surface = self.GetVolatilitySurface()
+        self.credit_spread = self.CalculateCreditSpread()
+        self.credit_spread_curve = self.GetCreditSpreadCurve()
+        self.issuer = self.GetIssuer()
+        self.ticker = self.GetTicker()
+        self.bbg_conv_rate = self.GetBBGConvRate()
+        
+        self.m_borrow_cost.SetData(self.borrow_cost)
+        self.m_volatility.SetData(self.volatility)
+        self.m_credit_spread.SetData(self.credit_spread)
+        
+        self.m_borrow_cost_curve.Visible(self.m_see_borrow_cost_details.Checked())
+        self.m_borrow_cost_curve.Populate(list(acm.FYieldCurve.Select(f"currency = '{self.GetCurrentObject().Currency().Name()}'")) + ['', self.borrow_cost_curve])
+        self.m_borrow_cost_curve.SetData(self.borrow_cost_curve)
+        self.m_volatility_surface.Visible(self.m_see_volatility_details.Checked())
+        self.m_volatility_surface.Populate(list(acm.FVolatilityStructure.Select(f"currency = '{self.GetCurrentObject().Currency().Name()}'")) + ['', self.volatility_surface])
+        self.m_volatility_surface.SetData(self.volatility_surface)
+        self.m_credit_spread_curve.Visible(self.m_see_credit_spread_details.Checked())
+        self.m_credit_spread_curve.Populate(list(acm.FYieldCurve.Select(f"currency = '{self.GetCurrentObject().Currency().Name()}' and type = 'Instrument Spread'")) + ['', self.credit_spread_curve])
+        self.m_credit_spread_curve.SetData(self.credit_spread_curve)
+        self.m_issuer.Populate(list(acm.FIssuer.Select('')) + [''])
+        self.m_issuer.SetData(self.issuer)
+        self.m_ticker.SetData(self.ticker)
+        self.m_bbg_conv_rate.SetData(self.bbg_conv_rate)
+        
+        
+        
+    def PopulateData(self):
+        self.m_borrow_cost.SetData(self.borrow_cost)
+        self.m_borrow_cost_curve.Populate(list(acm.FYieldCurve.Select(f"currency = '{self.GetCurrentObject().Currency().Name() if self.GetCurrentObject() else ''}'")) + ['', self.borrow_cost_curve])
+        self.m_borrow_cost_curve.SetData(self.borrow_cost_curve)
+        self.m_volatility.SetData(self.volatility)
+        self.m_volatility_surface.Populate(list(acm.FVolatilityStructure.Select(f"currency = '{self.GetCurrentObject().Currency().Name() if self.GetCurrentObject() else ''}'")) + ['', self.volatility_surface])
+        self.m_credit_spread.SetData(self.credit_spread)
+        self.m_credit_spread_curve.Populate(list(acm.FYieldCurve.Select(f"currency = '{self.GetCurrentObject().Currency().Name() if self.GetCurrentObject() else ''}' and type = 'Instrument Spread'")) + ['', self.credit_spread_curve])
+        self.m_credit_spread_curve.SetData(self.credit_spread_curve)
+        self.m_issuer.Populate(list(acm.FIssuer.Select('')) + [''])
+        self.m_issuer.SetData(self.issuer)
+        self.m_ticker.SetData(self.ticker)
+        self.m_bbg_conv_rate.SetData(self.bbg_conv_rate)
+        
+    def HandleCreate(self, creationInfo):
+        b = acm.FUxLayoutBuilder()
+        
+        b.BeginVertBox('None')
+        #b.AddFill()
+        
+        b.BeginHorzBox('None')
+        b.AddInput('borrow_cost', 'Borrow Cost (%)', 20, 20)
+        b.AddCheckbox('see_borrow_cost_details', 'See details...')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddPopuplist('borrow_cost_curve', 'Spread curve')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddInput('volatility', 'Volatility (%)', 20, 20)
+        b.AddCheckbox('see_volatility_details', 'See details...')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddPopuplist('volatility_surface', 'Volatility surface')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddInput('credit_spread', 'Credit Spread (bps)', 20, 20)
+        b.AddCheckbox('see_credit_spread_details', 'See details...')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddPopuplist('credit_spread_curve', 'Spread curve')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddPopuplist('issuer', 'Issuer')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddInput('ticker', 'Ticker')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddInput('bbg_conv_rate', 'BBG Conversion Rate')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddCheckbox('test_mode', 'Test mode')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        
+        b.BeginHorzBox('None')
+        b.AddButton('update', 'Update')
+        b.EndBox()
+        
+        b.BeginHorzBox('None')
+        b.AddButton('discard', 'Discard')
+        b.EndBox()
+        
+        b.EndBox()
+        
+        b.EndBox()
+        
+        layout = creationInfo.AddPane(b, 'listPane')
+        
+        self.borrow_cost = self.CalculateBorrowCost()
+        self.borrow_cost_curve = self.GetBorrowCostCurve()
+        self.volatility = self.CalculateVolatility()
+        self.credit_spread = self.CalculateCreditSpread()
+        self.issuer = self.GetIssuer()
+        self.ticker = self.GetTicker()
+        self.bbg_conv_rate = self.GetBBGConvRate()
+        
+        self.m_borrow_cost = layout.GetControl('borrow_cost')
+        self.m_volatility = layout.GetControl('volatility')
+        self.m_credit_spread = layout.GetControl('credit_spread')
+        self.m_issuer = layout.GetControl('issuer')
+        self.m_ticker = layout.GetControl('ticker')
+        self.m_bbg_conv_rate = layout.GetControl('bbg_conv_rate')
+        
+        self.m_borrow_cost_curve = layout.GetControl('borrow_cost_curve')
+        self.m_borrow_cost_curve.Visible(False)
+        self.m_see_borrow_cost_details = layout.GetControl('see_borrow_cost_details')
+        
+        self.m_volatility_surface = layout.GetControl('volatility_surface')
+        self.m_volatility_surface.Visible(False)
+        self.m_see_volatility_details = layout.GetControl('see_volatility_details')
+        
+        self.m_credit_spread_curve = layout.GetControl('credit_spread_curve')
+        self.m_credit_spread_curve.Visible(False)
+        self.m_see_credit_spread_details = layout.GetControl('see_credit_spread_details')
+        
+        self.m_test_mode = layout.GetControl('test_mode')
+        self.m_update_button = layout.GetControl('update')
+        self.m_discard_button = layout.GetControl('discard')
+        
+        self.m_see_borrow_cost_details.AddCallback('Activate', self.OnSeeBorrowCostDetails, None)
+        self.m_see_volatility_details.AddCallback('Activate', self.OnSeeVolatilityDetails, None)
+        self.m_see_credit_spread_details.AddCallback('Activate', self.OnSeeCreditSpreadDetails, None)
+        
+        self.m_update_button.AddCallback('Activate', self.OnUpdate, None)
+        self.m_discard_button.AddCallback('Activate', self.OnDiscard, None)
+        
+        self.EnableOnIdleCallback(True)
+        
+        self.SetCaption()
+        self.PopulateData()
+        
+        
+    def GetInstrumentSpread(self, ins, curve):
+        for ins_spread in curve.InstrumentSpreads():
+            if ins_spread.Instrument() == ins:
+                return ins_spread
+                
+        ins_spread = acm.FInstrumentSpread()
+        ins_spread.Curve(curve)
+        ins_spread.Instrument(ins)
+        ins_spread.UnderlyingYieldCurve(curve.UnderlyingCurve())
+        ins_spread.SpreadType('Yield')
+        ins_spread.Commit()
+        return ins_spread
+        
+        
+    def UpdateBorrowCost(self, value):
+        ins = self.m_currentObject
+        try:
+            if not self.m_test_mode.Checked():
+                underlying = ins.Underlying()
+                if self.m_borrow_cost_curve:
+                    spread_curve_name = self.m_borrow_cost_curve.GetData()
+                else:
+                    spread_curve_name = self.GetStockBorrow(underlying)
+                    
+                spread_curve = acm.FYieldCurve[spread_curve_name]
+                if spread_curve:
+                    ins_spread = self.GetInstrumentSpread(underlying, spread_curve)
+                    ins_spread_clone = ins_spread.Clone()
+                    ins_spread_clone.Spread(value)
+                    ins_spread.Apply(ins_spread_clone)
+                    ins_spread.Commit()
+                    self.credit_spread = value
+            logger.LOG(f'Updated borrow cost for instrument {ins.Name()} with value {value}!')
+            return True
+        except Exception as e:
+            self.ShowMessageBox('Error', f'Cant update borrow cost for instrument {ins.Name()} - {e}')
+            logger.LOG(f'Cant update borrow cost for instrument {ins.Name()} - {e}')
+            return False
+            
+    def CreatePoint(self, ins, vol_structure, new_vol):
+        try:
+            print('[INFO] - CreatePoint - Test mode:', self.m_test_mode.Checked())
+            if not self.m_test_mode.Checked():
+                point = acm.FVolatilityPoint()
+                point.Structure(vol_structure)
+                point.Benchmark(ins)
+                point.Volatility(new_vol)
+                point.Commit()
+                self.volatility = new_vol
+            logger.LOG(f'Created new point in volatility surface {vol_structure.Name()} for instrument {ins.Name()} with volatility {new_vol}!')
+        except Exception as e :
+            logger.LOG(f'Failed to create point in volatility surface {vol_structure.Name()} for instrument {ins.Name()} with volatility {new_vol} - {e}!')
+            
+    def UpdatePoint(self, ins, vol_structure, new_vol, create_new=True, match_exact=False):
+        if not isinstance(new_vol, float):
+            logger.ELOG(f'Invalid volatility value {new_vol} of type {type(new_vol)}!')
+        else:
+            if self.GetPoint(vol_structure, ins, match_exact):
+                try:
+                    print('[INFO] - UpdatePoint - Test mode:', self.m_test_mode.Checked())
+                    if not self.m_test_mode.Checked():
+                        vol_structure_clone = vol_structure.Clone()
+                        point_clone = self.GetPoint(vol_structure_clone, ins, match_exact)
+                        if vol_structure.IsSpreadStructure():
+                            point_clone.VolatilityTotal(new_vol)
+                        else:
+                            point_clone.Volatility(new_vol)
+                        vol_structure.Apply(vol_structure_clone)
+                        vol_structure.Commit()
+                        self.volatility = new_vol
+                    logger.LOG(f'Updated volatility surface {vol_structure.Name()} for instrument {ins.Name()} with volatility {new_vol}!')
+                except Exception as e:
+                    logger.LOG(f'Failed to update volatility surface {vol_structure.Name()} for instrument {ins.Name()} with volatility {new_vol} - {e}!')
+            else:
+                if create_new:
+                    if vol_structure.IsSpreadStructure():
+                        logger.LOG(f'No suitable point found on spread volatility surface {vol_structure.Name()} for instrument {ins.Name()}, please create a suitable point manually!')
+                    else:
+                        self.CreatePoint(ins, vol_structure, new_vol)
+                        
+    def GetVolPoint(self, ins, vol_structure):
+        for vol_point in vol_structure.Points():
+            if vol_point.Benchmark() == ins:
+                return vol_point
+                
+        vol_point = acm.FVolatilityPoint()
+        vol_point.Benchmark(ins)
+        vol_point.Structure(vol_structure)
+        vol_point.Commit()
+        return vol_point
+            
+    def UpdateVolatility(self, value):
+        ins = self.m_currentObject
+        try:
+            if self.m_volatility_surface:
+                vol_structure_name = self.m_volatility_surface.GetData()
+                vol_structure = acm.FVolatilityStructure[vol_structure_name]
+                vol_point = self.GetVolPoint(ins, vol_structure)
+                vol_point_clone = vol_point.Clone()
+                vol_point_clone.Volatility(value)
+                vol_point.Apply(vol_point_clone)
+                vol_point.Commit()
+            else:
+                vol_structure = ins.MappedVolatilityLink().Link().VolatilityStructure()
+                self.UpdatePoint(ins, vol_structure, value)
+            return True
+        except Exception as e:
+            self.ShowMessageBox('Error', f'Cant update volatility for instrument {ins.Name()} - {e}')
+            logger.LOG(f'Cant update volatility for instrument {ins.Name()} - {e}')
+            return False
+        
+        
+    def UpdateCreditSpread(self, value):
+        ins = self.m_currentObject
+        try:
+            if not self.m_test_mode.Checked():
+                if self.m_credit_spread_curve and self.m_credit_spread_curve != '':
+                    curve_name = self.m_credit_spread_curve.GetData()
+                    curve = acm.FYieldCurve[curve_name]
+                    if (str(curve.ClassName()) != 'FInstrumentSpreadCurve'):
+                        print(f'YES {curve.Name()} is not a FInstrumentSpreadCurve its class name {curve.ClassName()}')
+                        self.ShowMessageBox('Error', f'Cant update credit spread for instrument {ins.Name()}\n Please choose another Yield Curve for Credit Spread')
+                        logger.LOG(f'Cant update credit spread for instrument {ins.Name()} - Credit spread curve class is not a FInstrumentSpreadCurve')
+                        return False
+                    
+                    ins_spread = self.GetInstrumentSpread(ins, curve)
+                    ins_spread_clone = ins_spread.Clone()
+                    ins_spread_clone.Spread(value)
+                    ins_spread.Apply(ins_spread_clone)
+                    ins_spread.Commit()
+                    self.credit_spread = value
+                    
+                else:
+                    curve = ins.MappedCreditLink().Link().YieldCurveComponent()
+                    if(str(ins.MappedCreditLink().Link().YieldCurveComponent().ClassName()) != 'FInstrumentSpread'):
+                        print('YES it is not a FInstrumentSpread')
+                        acm.UX().Dialogs().MessageBoxOKCancel(self.m_shell, 'Error', f'Cant update credit spread for instrument {ins.Name()}\n Please choose another Yield Curve for Credit Spread')
+                        logger.LOG('Cant update credit spread for instrument {ins.Name()} - Credit spread curve class is not a FInstrumentSpread')
+                        return False
+                        
+                    print('Damn')
+                
+                    linked_credit_spread = ins.MappedCreditLink().Link().YieldCurveComponent()
+                    linked_credit_spread_clone = linked_credit_spread.Clone()
+                    linked_credit_spread_clone.Spread(value)
+                    linked_credit_spread.Apply(linked_credit_spread_clone)
+                    linked_credit_spread.Commit()
+                    self.credit_spread = value
+            logger.LOG(f'Updated credit spread for instrument {ins.Name()} with value {value}!')
+            return True
+        except Exception as e:
+            errorMessage = f'Cant update credit spread for instrument {ins.Name()} - {e}'
+            self.ShowMessageBox('Error', errorMessage)
+            logger.LOG(errorMessage)
+            return False
+        
+    def UpdateIssuer(self, value):
+        ins = self.m_currentObject
+        try:
+            print('[INFO] - UpdateIssuer - Test mode:', self.m_test_mode.Checked())
+            if not self.m_test_mode.Checked():
+                issuer = acm.FIssuer[value] if value != '' else None
+                ins.Issuer(issuer)
+                ins.Commit()
+                self.issuer = value
+            logger.LOG(f'Updated issuer for instrument {ins.Name()} with value {value}!')
+            return True
+        except Exception as e:
+            errorMessage =  f'Cant update issuer for instrument {ins.Name()} - {e}'
+            self.ShowMessageBox('Error', errorMessage)
+            logger.LOG(errorMessage)
+            return False
+        
+    def UpdateTicker(self, value):
+        ins = self.m_currentObject
+        try:
+            if not self.m_test_mode.Checked():
+                und = ins.Underlying()
+                for a in und.Aliases():
+                    if a.Type().AliasTypeName() == 'BB_TICKER':
+                        a.Alias(value)
+                        a.Commit()
+                        logger.LOG(f'Updated ticker for instrument {ins.Name()} with value {value}!')
+                        return
+                al_type = acm.FInstrAliasType['BB_TICKER']
+                a = acm.FInstrumentAlias()
+                a.Alias(value)
+                a.Instrument(und)
+                a.RecordType('InstrumentAlias')
+                a.Type(al_type)
+                a.Commit()
+            logger.LOG(f'Create ticker for instrument {ins.Name()} with value {value}!')
+            return True
+        except Exception as e:
+            errorMessage = f'Cant update ticker for instrument {ins.Name()} - {e}'
+            self.ShowMessageBox('Error', errorMessage)
+            logger.LOG(errorMessage)
+            return False
+            
+            
+    def UpdateBBGConvRate(self, value):
+        ins = self.GetCurrentObject()
+        if not self.m_test_mode.Checked():
+            try:
+                for add_info in ins.AddInfos():
+                    if add_info.AddInf().FieldName() == 'BBGconvRate':
+                        add_info.FieldValue(value)
+                        add_info.Commit()
+                        logger.LOG(f'Create ticker for instrument {ins.Name()} with value {value}!')
+                        return True
+                        
+                add_info_spec = acm.FAdditionalInfoSpec['BBGconvRate']
+                add_info = acm.FAdditionalInfo()
+                add_info.AddInf(add_info_spec)
+                add_info.Parent(ins)
+                add_info.FieldValue(value)
+                add_info.Commit()
+                logger.LOG(f'Create ticker for instrument {ins.Name()} with value {value}!')
+                return True
+            except:
+                errorMessage = f'Cant update BBG Conversation Rate for instrument {ins.Name()} - {e}'
+                self.ShowMessageBox('Error', errorMessage)
+                logger.LOG(errorMessage)
+                return False
+            
+            
+    def OnSeeBorrowCostDetails(self, ud, cd):
+        self.UpdateControls()
+        
+        
+    def OnSeeVolatilityDetails(self, ud, cd):
+        self.UpdateControls()
+        
+        
+    def OnSeeCreditSpreadDetails(self, ud, cd):
+        self.UpdateControls()
+        
+        
+    def OnUpdate(self, ud, cd):
+        print('=== ON UPDATE ===')
+        nil_list = ['nil', '', None]
+        
+        updated_info = ''
+        info_about_mapped_curves = []
+        
+        if(self.m_borrow_cost.GetData() not in nil_list):
+            new_borrow_cost = float(self.m_borrow_cost.GetData())
+            if self.m_borrow_cost_curve.GetData() == self.GetBorrowCostCurve():
+                old_borrow_cost = self.borrow_cost
+            else:
+                underlying = self.GetCurrentObject().Underlying()
+                spread_curve_name = self.m_borrow_cost_curve.GetData()
+                spread_curve = acm.FYieldCurve[spread_curve_name]
+                ins_spread = self.GetInstrumentSpread(underlying, spread_curve)
+                old_borrow_cost = ins_spread.Spread() * 100
+            if (old_borrow_cost is None or abs(new_borrow_cost - old_borrow_cost) > precision):
+                if self.UpdateBorrowCost(new_borrow_cost / 100):
+                    updated_info += f'\nBorrow cost has been updated from {old_borrow_cost} to {new_borrow_cost}.'
+                    if self.m_borrow_cost_curve.GetData() != self.GetBorrowCostCurve():
+                        info_about_mapped_curves.append('the curve you choose for Borrow Cost')
+                
+        if(self.m_volatility.GetData() not in nil_list):
+            new_volatility = float(self.m_volatility.GetData())
+            if self.m_volatility_surface.GetData() == self.GetVolatilitySurface():
+                old_volatility = self.volatility
+            else:
+                vol_structure_name = self.m_volatility_surface.GetData()
+                vol_structure = acm.FVolatilityStructure[vol_structure_name]
+                vol_point = self.GetVolPoint(self.GetCurrentObject(), vol_structure)
+                old_volatility = vol_point.Volatility() * 100
+            if (old_volatility is None or abs(new_volatility - old_volatility) > precision):
+                if self.UpdateVolatility(new_volatility / 100):
+                    updated_info += f'\nVolatility has been updated from {old_volatility} to {new_volatility}'
+                    if self.m_volatility_surface.GetData() != self.GetVolatilitySurface():
+                        info_about_mapped_curves.append('the Volatility Surface you choose')
+            
+        print('Credit Spread: ', self.m_credit_spread.GetData())
+        if(self.m_credit_spread.GetData() not in nil_list):
+            new_credit_spread = float(self.m_credit_spread.GetData())
+            if self.m_credit_spread_curve.GetData() == self.GetCreditSpreadCurve():
+                old_credit_spread = self.credit_spread 
+            else:
+                curve_name = self.m_credit_spread_curve.GetData()
+                curve = acm.FYieldCurve[curve_name]
+                ins_spread = self.GetInstrumentSpread(self.GetCurrentObject(), curve)
+                old_credit_spread = ins_spread.Spread() * 10000
+            if (old_credit_spread is None or abs(new_credit_spread - old_credit_spread) > precision):
+                if self.UpdateCreditSpread(new_credit_spread / 10000):
+                    if self.m_credit_spread_curve.GetData() != self.GetCreditSpreadCurve():
+                        info_about_mapped_curves.append('the curve you choose for Credit Spread')
+                    updated_info += f'\nCredit Spread has been updated from {old_credit_spread} to {new_credit_spread}'
+                    
+           
+        if(self.m_issuer.GetData() is not None):
+            new_issuer = self.m_issuer.GetData()
+            if new_issuer != self.issuer:
+                if self.UpdateIssuer(new_issuer):
+                    updated_info += f'Issuer has been updated from {self.issuer} to {new_issuer}\n'
+            
+        if(self.m_ticker.GetData() is not None):
+            new_ticker = self.m_ticker.GetData()
+            if new_ticker != self.ticker:
+                if self.UpdateTicker(new_ticker):
+                    updated_info += f'Ticker has been updated from {self.ticker} to {new_ticker}\n'
+                    
+        if(self.m_bbg_conv_rate.GetData() is not None):
+            new_bbg_conv_rate = self.m_bbg_conv_rate.GetData()
+            if new_bbg_conv_rate != self.bbg_conv_rate:
+                if self.UpdateBBGConvRate(new_bbg_conv_rate):
+                    updated_info += f'BBG Conversion Rate has been updated from {self.bbg_conv_rate} to {new_bbg_conv_rate}\n'
+            
+        print('=== BEFORE UPDATED INFO CHECKING')
+        if updated_info != '':
+            if info_about_mapped_curves:
+                if len(info_about_mapped_curves) > 1:
+                    curves_info = ', '.join(info_about_mapped_curves)
+                    curves_info += ' are'
+                else:
+                    curves_info = info_about_mapped_curves[0]
+                    curves_info += ' is'
+                updated_info += f'\nBut {curves_info} not mapped to corresponding instrument! Please do it manually or contact AS_CB_SUPPORT@hk.mizuho-sc.com'
+        else:
+            updated_info = 'Nothing has been changed'
+            
+        print('=== AFTER UPDATED INFO CHECKING ===')
+        print('*** SHOWING MESSAGE BOX ***')
+        self.ShowMessageBox('Information', updated_info)
+                
+        self.UpdateControls()
+            
+    def OnDiscard(self, ud, cd):
+        self.PopulateData()
+
+...
+
